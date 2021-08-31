@@ -1,0 +1,23 @@
+version: "3"
+networks:
+  template_grpc_network:
+    driver: bridge
+services:
+  db:
+    image: postgres:13.3-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: tests
+    restart: on-failure
+    networks:
+      - template_grpc_network
+  template-grpc-service:
+    image: template-grpc-service:latest
+    ports:
+      - 8080:8080
+      - 6060:6060
+      - 2112:2112
+    environment:
+      RDS_URL: postgres://postgres:tests@localhost:5432/postgres?sslmode=disable
+    networks:
+      - template_grpc_network

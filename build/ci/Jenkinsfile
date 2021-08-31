@@ -1,0 +1,211 @@
+pipeline {
+
+    agent {
+        label 'jenkins-slave-golang'
+    }
+
+    options {
+        timestamps()
+        disableResume()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '15', artifactNumToKeepStr: '10', daysToKeepStr: '15', numToKeepStr: '10'))
+    }
+
+    stages {
+        stage("Initial") {
+            steps {
+                script {
+                    if (GIT_BRANCH == 'master') {
+                        env.ENVIRONMENT = "prod"
+                        env.UNIQUE_BUILD_ID = "${ENVIRONMENT}-${BUILD_NUMBER}" // used by makefile to tag docker image and github release
+                    } else if (GIT_BRANCH.startsWith('PR-')) {
+                        env.ENVIRONMENT = "stage"
+                        env.UNIQUE_BUILD_ID = "${GIT_BRANCH}-${ENVIRONMENT}-${BUILD_NUMBER}" // used by makefile to tag docker image and github release
+                    } else {
+                        error("Expected branches master or PR-*, found '${GIT_BRANCH}'. Please use ${env.JOB_NAME}-manual for other branches.")
+                    }
+
+                    env.REPO_NAME = getRepo()
+                    env.DOCKER_LATEST_TAG = "latest-${ENVIRONMENT}"
+                }
+            }
+        }
+
+        stage('Checks') {
+            failFast true
+            parallel {
+                stage('Update-to-date') {
+                    steps {
+                        sh "make check-up-to-date"
+                    }
+                }
+                stage('Format & Lint') {
+                    stages {
+                        stage('Format') {
+                            steps {
+                                sh "make check-format"
+                            }
+                        }
+                        stage('Lint') {
+                            steps {
+                                sh "make lint"
+                            }
+                        }
+                    }
+                }
+                stage('Test') {
+                    steps {
+                        sh "make test"
+                    }
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh "make docker-build"
+            }
+        }
+
+        stage('Upload To AWS ECR') {
+            when {
+                branch 'master'
+            }
+            steps {
+                script {
+                    sh """
+                        aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 410715645895.dkr.ecr.us-east-1.amazonaws.com
+                        
+                        docker tag ${env.REPO_NAME}:${UNIQUE_BUILD_ID} ${AWS_ECR_URL}/${env.REPO_NAME}:${DOCKER_LATEST_TAG}
+                        docker tag ${env.REPO_NAME}:${UNIQUE_BUILD_ID} ${AWS_ECR_URL}/${env.REPO_NAME}:${UNIQUE_BUILD_ID}
+
+                        docker push ${AWS_ECR_URL}/${env.REPO_NAME}:${DOCKER_LATEST_TAG}
+                        docker push ${AWS_ECR_URL}/${env.REPO_NAME}:${UNIQUE_BUILD_ID}
+
+                        # We don't need to remove the `${env.REPO_NAME}:${UNIQUE_BUILD_ID}` image here,
+                        # because it will be removed when calling `make docker-clean` on the post-stage
+                        docker image rm -f ${AWS_ECR_URL}/${env.REPO_NAME}:${UNIQUE_BUILD_ID}
+                        docker image rm -f ${AWS_ECR_URL}/${env.REPO_NAME}:${DOCKER_LATEST_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Github Release') {
+            when {
+                branch 'master'
+            }
+            steps {
+                // Tag the git branch
+                withCredentials([usernamePassword(credentialsId: 'github-sliide-deploy-basic-auth', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
+                    sh """
+                        git config --local credential.helper "!f() { echo username=\\$GIT_USERNAME; echo password=\\$GIT_PASSWORD; }; f"
+                        git tag ${UNIQUE_BUILD_ID} ${GIT_COMMIT}
+                        git push origin ${UNIQUE_BUILD_ID}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Stage') {
+            when {
+                branch 'master'
+            }
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig-sliide-main', variable: 'KUBECONFIG')]) {
+                    sh "helm upgrade ${env.REPO_NAME}-stage ./deployments/helm --install --namespace stage --wait --timeout 5m --values ./deployments/helm/values/stage.yaml --set-string buildId=${UNIQUE_BUILD_ID} --history-max 3"
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'master'
+            }
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig-sliide-main', variable: 'KUBECONFIG')]) {
+                    sh "helm upgrade ${env.REPO_NAME}-${ENVIRONMENT} ./deployments/helm --install --namespace ${ENVIRONMENT} --wait --timeout 5m --values ./deployments/helm/values/${ENVIRONMENT}.yaml --set-string buildId=${UNIQUE_BUILD_ID} --history-max 3"
+                }
+            }
+        }
+
+        stage('Slack') {
+            when {
+                branch 'master'
+            }
+            steps {
+                script {
+                    def changelog_string = getChangeString()
+            
+                    attachments = [[
+                        fallback: "${env.REPO_NAME} ${ENVIRONMENT} Successful",
+                        color: "good",
+                        text: "<${env.BUILD_URL}|${UNIQUE_BUILD_ID} Changelog:>\n ${changelog_string}"
+                    ]]
+
+                    slackSend(
+                        botUser: true,
+                        channel: '#techies',
+                        attachments: attachments,
+                        teamDomain: 'sliide',
+                        tokenCredentialId: 'slack-jenkins-token',
+                        username: "${env.REPO_NAME} ${ENVIRONMENT}"
+                    )
+                }
+            }
+        }
+    }
+
+    post { 
+        always {
+            script {
+                // Clean the image from `make docker-build`
+                sh "make docker-clean"
+            }
+        }
+        unsuccessful {
+            script {
+                sendSlack('Unsuccessful', 'danger', "@ops @backend No! No! what's happening?")
+            }
+        }
+    }
+}
+
+String getRepo() {
+    return env.GIT_URL.tokenize('/')[3].split("\\.")[0]
+}
+
+def sendSlack(buildStatus, colour, message) {
+    attachments = [[
+        fallback: "${env.REPO_NAME} ${ENVIRONMENT} ${buildStatus}",
+        color: colour,
+        text: "*<${env.BUILD_URL}|${UNIQUE_BUILD_ID}:>* ${message}"
+    ]]
+
+    slackSend(
+        attachments: attachments,
+        botUser: true,
+        channel: '#jenkins-builds',
+        teamDomain: 'sliide',
+        tokenCredentialId: 'slack-jenkins-token',
+        username: "${env.REPO_NAME}",
+    )
+}
+
+String getChangeString() {
+    def changeLogSets = currentBuild.changeSets
+    def changeLog = ""
+    for (int i = 0; i < changeLogSets.size(); i++) {
+        def entries = changeLogSets[i].items
+        for (int j = 0; j < entries.length; j++) {
+            def entry = entries[j]
+            changeLog += "[${entry.author}] ${entry.msg}\n"
+        }
+    }
+
+    if (changeLog == "") {
+        return "No commits since last ${ENVIRONMENT} build"
+    }
+
+    return changeLog
+}

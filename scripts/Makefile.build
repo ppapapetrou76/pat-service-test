@@ -1,0 +1,16 @@
+#### Build targets
+
+## Builds the go binary
+go-build:
+	@ $(DOCKER_RUN_TOOLS) /bin/bash -c "GOOS=linux go build -o main"
+
+## Builds the docker app image
+docker-build:
+	docker build -t $(DOCKER_IMAGE_APP) --build-arg "PIPELINE_VERSION=${UNIQUE_BUILD_ID}" -f deployments/docker/app/Dockerfile . && \
+	echo $$(docker image inspect -f='{{.Size}}' $(DOCKER_IMAGE_APP)) | awk '{ val = $$1 / 1024 / 1024 ; print "Successfully read size " val "MB" }'
+
+## Removes the latest docker app image
+docker-clean:
+	docker image rm -f $(DOCKER_IMAGE_APP)
+
+build: docker-build ## Build

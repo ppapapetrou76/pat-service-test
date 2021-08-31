@@ -1,0 +1,250 @@
+pipeline {
+
+    agent {
+        label 'jenkins-slave-golang'
+    }
+
+    options {
+        timestamps()
+        disableResume()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '15', artifactNumToKeepStr: '10', daysToKeepStr: '15', numToKeepStr: '10'))
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'stage', 'prod'], description: 'Target environment to build to')
+        string(name: 'BRANCH_NAME', defaultValue: 'master', description: 'Github branch to build from')
+        booleanParam(name: 'RUN_TESTS', defaultValue: true, description: 'Whether to run tests.')
+        booleanParam(name: 'RUN_LINTS', defaultValue: true, description: 'Whether to run lint-style.')
+        booleanParam(name: 'DEPLOY', defaultValue: true, description: 'Deploy to servers?')
+    }
+
+    environment {
+        UNIQUE_BUILD_ID = "${params.ENVIRONMENT}-${env.BUILD_NUMBER}" // used by makefile to tag docker image
+        DOCKER_LATEST_TAG = "latest-${params.ENVIRONMENT}"
+    }
+
+    stages {
+        stage("Initial") {
+            steps {
+                script {
+                    currentBuild.displayName = "${env.UNIQUE_BUILD_ID}"
+                    currentBuild.description = "Env: ${params.ENVIRONMENT}, Branch: ${params.BRANCH_NAME}"
+                    env.REPO_NAME = getRepo()
+                }
+            }
+        }
+
+        stage('Checks') {
+            failFast false
+            parallel {
+                stage('Update-to-date') {
+                    when {
+                        expression { return doUpToDateChecking() }
+                    }
+                    steps {
+                        sh "make check-up-to-date"
+                    }
+                }
+                stage('Format & Lint') {
+                    stages {
+                        stage('Format') {
+                            when {
+                                expression { return doFormatChecking() }
+                            }
+                            steps {
+                                sh "make check-format"
+                            }
+                        }
+                        stage('Lint') {
+                            when {
+                                expression { return doLint() }
+                            }
+                            steps {
+                                sh "make lint"
+                            }
+                        }
+                    }
+                }
+                stage('Test') {
+                    when {
+                        expression { return doTest() }
+                    }
+                    steps {
+                        sh "make test"
+                    }
+                }
+            }
+        }
+
+        stage('Build') {
+            when {
+                expression { return doBuild() }
+            }
+            steps {
+                sh "make docker-build"
+            }
+        }
+
+        stage('Upload To AWS ECR') {
+            when {
+                expression { return doDeploy() }
+            }
+            steps {
+                script {
+                    sh """
+                        aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 410715645895.dkr.ecr.us-east-1.amazonaws.com
+                        
+                        docker tag ${env.REPO_NAME}:${UNIQUE_BUILD_ID} ${AWS_ECR_URL}/${env.REPO_NAME}:${DOCKER_LATEST_TAG}
+                        docker tag ${env.REPO_NAME}:${UNIQUE_BUILD_ID} ${AWS_ECR_URL}/${env.REPO_NAME}:${UNIQUE_BUILD_ID}
+
+                        docker push ${AWS_ECR_URL}/${env.REPO_NAME}:${DOCKER_LATEST_TAG}
+                        docker push ${AWS_ECR_URL}/${env.REPO_NAME}:${UNIQUE_BUILD_ID}
+
+                        # We don't need to remove the `${env.REPO_NAME}:${UNIQUE_BUILD_ID}` image here,
+                        # because it will be removed when calling `make docker-clean` on the post-stage
+                        docker image rm -f ${AWS_ECR_URL}/${env.REPO_NAME}:${UNIQUE_BUILD_ID}
+                        docker image rm -f ${AWS_ECR_URL}/${env.REPO_NAME}:${DOCKER_LATEST_TAG}
+                    """
+
+                    // Tag the git branch
+                    sshagent(['github-deploy-key-jenkins']) {
+                        sh """
+                            git tag ${UNIQUE_BUILD_ID} ${GIT_COMMIT}
+                            git push origin ${UNIQUE_BUILD_ID}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                expression { return doDeploy() }
+            }
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig-sliide-main', variable: 'KUBECONFIG')]) {
+                    sh "helm upgrade ${env.REPO_NAME}-${ENVIRONMENT} ./deployments/helm --install --namespace ${ENVIRONMENT} --timeout 5m --values ./deployments/helm/values/${ENVIRONMENT}.yaml --set-string buildId=${UNIQUE_BUILD_ID} --history-max 3"
+                }
+            }
+        }
+
+        stage('Slack') {
+            when {
+                expression { return doDeploy() }
+            }
+            steps {
+                script {
+                    def changelog_string = getChangeString()
+
+                    attachments = [[
+                        fallback: "Deploying ${env.REPO_NAME}-${ENVIRONMENT}",
+                        color: "good",
+                        text: "<${env.BUILD_URL}|${UNIQUE_BUILD_ID} Changelog:>\n ${changelog_string}"
+                    ]]
+
+                    slackSend(
+                        botUser: true,
+                        channel: '#techies',
+                        attachments: attachments,
+                        teamDomain: 'sliide',
+                        tokenCredentialId: 'slack-jenkins-token',
+                        username: "${env.REPO_NAME}-${ENVIRONMENT}"
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // Clean the image from `make docker-build`
+                if (doBuild()) {
+                    sh "make docker-clean"
+                }
+            }
+        }
+        success {
+            script {
+                sendSlack('Successful', 'good', "${GIT_BRANCH} ${ENVIRONMENT}-${BUILD_NUMBER} :tada:")
+            }
+        }
+        unsuccessful {
+            script {
+                sendSlack('Unsuccessful', 'danger', "@ops @backend No! No! what's happening?")
+            }
+        }
+    }
+}
+
+String getRepo() {
+	return env.GIT_URL.tokenize('/')[1].split("\\.")[0]
+}
+
+def sendSlack(buildStatus, colour, message) {
+    attachments = [[
+        fallback: "${env.JOB_NAME} ${ENVIRONMENT} ${buildStatus}",
+        color: colour,
+        text: "*<${env.BUILD_URL}|${UNIQUE_BUILD_ID}:>* ${message}"
+    ]]
+
+    slackSend(
+        attachments: attachments,
+        botUser: true,
+        channel: '#jenkins-builds',
+        teamDomain: 'sliide',
+        tokenCredentialId: 'slack-jenkins-token',
+        username: "${env.JOB_NAME}",
+    )
+}
+
+Boolean isPRBuild() {
+    return env.CHANGE_ID
+}
+
+Boolean isProdBuild() {
+    return env.ENVIRONMENT == 'prod'
+}
+
+Boolean doFormatChecking() {
+    return isPRBuild() // Only check the format for PRs
+}
+
+Boolean doUpToDateChecking() {
+    return isPRBuild() // Only check the code for PRs
+}
+
+Boolean doLint() {
+    return isPRBuild() || isProdBuild() || env.RUN_LINTS == 'true'
+}
+
+Boolean doTest() {
+    return isPRBuild() || isProdBuild() || env.RUN_TESTS == 'true'
+}
+
+Boolean doBuild() {
+    return isPRBuild() || env.DEPLOY == 'true'
+}
+
+Boolean doDeploy() {
+    return !isPRBuild() && env.DEPLOY == 'true'
+}
+
+String getChangeString() {
+    def changeLogSets = currentBuild.changeSets
+    def changeLog = ""
+    for (int i = 0; i < changeLogSets.size(); i++) {
+        def entries = changeLogSets[i].items
+        for (int j = 0; j < entries.length; j++) {
+            def entry = entries[j]
+            changeLog += "[${entry.author}] ${entry.msg}\n"
+        }
+    }
+
+    if (changeLog == "") {
+        return "No commits since last ${ENVIRONMENT} build"
+    }
+
+    return changeLog
+}

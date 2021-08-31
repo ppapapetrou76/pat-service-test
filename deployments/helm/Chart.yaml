@@ -1,0 +1,7 @@
+apiVersion: v2
+name: template-grpc-service
+description: A Helm chart for Kubernetes deployments
+version: 1.0.0
+maintainers:
+  - email: devops@sliideapp.com
+    name: SliideDevOps

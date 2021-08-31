@@ -1,0 +1,61 @@
+#### Development targets
+
+## Runs the tests
+test:
+	$(DOCKER_RUN_TOOLS) bash -c "go test -timeout 2m -race ./... ${ARGS}"
+
+## Adds a package (make add-package PKG=github.com/sliide/shared-go-libs)
+add-package:
+	$(DOCKER_RUN_TOOLS) bash -c "go get ${PKG}"
+
+## Installs required dependencies
+ensure-package:
+	$(DOCKER_RUN_TOOLS) bash -c "go mod download && go mod vendor && go mod tidy"
+
+## Runs linters
+lint:
+	$(DOCKER_RUN_TOOLS) bash -c "check-lint.sh"
+
+## Formats code
+format:
+	$(DOCKER_RUN_TOOLS) bash -c "format.sh"
+
+## Checks the format of go code
+check-format:
+	$(DOCKER_RUN_TOOLS) bash -c "check-format.sh"
+
+## Generates mocks files and template files from proto files
+generate:
+	$(DOCKER_RUN_TOOLS) bash -c "generate.sh"
+
+## Checks the generated code is up-to-date
+check-up-to-date:
+	$(DOCKER_RUN_TOOLS) bash -c "check-up-to-date.sh"
+
+## Runs all checks before commit
+pre-commit:
+	$(DOCKER_RUN_TOOLS) bash -c "make check-format lint check-up-to-date test"
+
+## Starts a postgres DB docker container under the name `db` exposing the port 5432 to the host.
+start-db:
+	@ echo "Starting DB container..."
+	@ docker run -d --rm --name db -p 5432:5432 -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=tests postgres:13.3-alpine
+
+## Stops the postgres DB docker container named `db`.
+stop-db:
+	@ echo "Stopping DB container..."
+	@ docker rm -f db
+
+## Starts the service locally ( single docker container )
+start: docker-build
+	docker run --rm -p 8080:8080 -p 6060:6060 -p 2112:2112 -e RDS_URL='$(RDS_URL)' --name ${PROJECT_NAME} $(DOCKER_IMAGE_APP) ./main
+
+## Starts the service locally ( all required components )
+## NOTE: You may need to authenticate with AWS ECR to access the images, please ref to https://sliide.atlassian.net/wiki/spaces/BE/pages/2018803790/ for detail
+start-all:
+	@ docker compose -f deployments/docker/app/docker-compose.yml -p ${UNIQUE_BUILD_ID} up -d
+	@ echo "You can access the service on http://localhost:8080"
+
+## Starts the service locally ( all required components )
+stop-all:
+	@ docker compose -f deployments/docker/app/docker-compose.yml -p ${UNIQUE_BUILD_ID} down --remove-orphans

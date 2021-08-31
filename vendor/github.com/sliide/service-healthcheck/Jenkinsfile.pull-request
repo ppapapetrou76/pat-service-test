@@ -1,0 +1,46 @@
+pipeline {
+
+    agent any
+
+    options {
+        timestamps()
+    }
+
+    stages {
+        stage("Initial") {
+            steps {
+                script {
+                    currentBuild.displayName = "${GIT_BRANCH}"
+                }
+            }
+        }
+
+        stage('Build Tools') {
+            steps {
+                sh "make tools-build"
+            }
+        }
+
+        stage('Checks') {
+            failFast false
+            parallel {
+                stage('Format') {
+                    steps {
+                        sh "make check-format"
+                    }
+                }
+                stage('Lint') {
+                    steps {
+                        sh "make lint"
+                    }
+                }
+
+                stage('Test') {
+                    steps {
+                        sh "make test"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,10 @@
+name: template-grpc-service
+replicas: 3
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 768Mi
+log_level: INFO
